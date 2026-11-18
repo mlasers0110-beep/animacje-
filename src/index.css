@@ -53,6 +53,16 @@ input[type="range"].studio-slider::-webkit-slider-thumb:hover {
   background: #e6c65a;
 }
 
+@media (pointer: coarse) {
+  input[type="range"].studio-slider {
+    height: 6px;
+  }
+  input[type="range"].studio-slider::-webkit-slider-thumb {
+    width: 22px;
+    height: 22px;
+  }
+}
+
 /* Custom subtle scrollbars for drawers */
 ::-webkit-scrollbar {
   width: 5px;

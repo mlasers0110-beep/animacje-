@@ -22,6 +22,11 @@ import {
   X,
   Zap,
 } from 'lucide-react';
+import {
+  GITHUB_README_MARKDOWN,
+  GITHUB_SHORT_DESCRIPTION,
+  GITHUB_TOPICS,
+} from '../data/githubPublicationContent';
 import { VISUAL_FX_PRESETS } from '../data/presetScenes';
 import {
   AspectRatioOption,
@@ -29,12 +34,15 @@ import {
   ChatMessage,
   DrawerTabId,
   KeyframeItem,
+  LiveCameraRigState,
   NarrativeToneId,
   ReadyPromptRecipe,
   SceneAsset,
   SceneNarrative,
+  UniversalControllerConfig,
   VisualEffectSettings,
 } from '../types/studio';
+import { UniversalConnectorBridgeState } from '../universal-controller/connectorProtocol';
 import {
   ExportResultInfo,
   exportFourFrameSequenceWebP,
@@ -44,6 +52,8 @@ import {
   renderVideoFromFourKeyframes,
 } from '../utils/mediaExporter';
 import { DirectorPreviz3DModule } from './DirectorPreviz3DModule';
+import { MobileGraphicsStudioModule } from './MobileGraphicsStudioModule';
+import { UniversalControllerModule } from './UniversalControllerModule';
 
 type MicTargetField = 'prompt' | 'chat' | 'story' | 'video';
 
@@ -56,8 +66,16 @@ interface StudioWorkspaceDrawerProps {
   settings: VisualEffectSettings;
   onApplySettings: (partial: Partial<VisualEffectSettings>) => void;
   onAddCustomScene: (scene: SceneAsset) => void;
+  onUploadImages: (files: FileList) => Promise<void>;
+  controller: UniversalControllerConfig;
+  onChangeController: (next: UniversalControllerConfig) => void;
   cameraBlocking: CameraBlockingConfig;
   onChangeCameraBlocking: (next: CameraBlockingConfig) => void;
+  liveCameraRig: LiveCameraRigState;
+  onChangeLiveCameraRig: (next: LiveCameraRigState) => void;
+  onCaptureVrToBlockingState: (target: 'A' | 'B') => void;
+  uscpState: UniversalConnectorBridgeState;
+  onSwitchToLocalTabletMode: () => void;
   keyframes: KeyframeItem[];
   onRegenerateInstantKeyframes: (
     customPrompts?: string[],
@@ -154,8 +172,16 @@ export const StudioWorkspaceDrawer: React.FC<StudioWorkspaceDrawerProps> = ({
   settings,
   onApplySettings,
   onAddCustomScene,
+  onUploadImages,
+  controller,
+  onChangeController,
   cameraBlocking,
   onChangeCameraBlocking,
+  liveCameraRig,
+  onChangeLiveCameraRig,
+  onCaptureVrToBlockingState,
+  uscpState,
+  onSwitchToLocalTabletMode,
   keyframes,
   onRegenerateInstantKeyframes,
   onUpdateKeyframeImage,
@@ -681,23 +707,11 @@ export const StudioWorkspaceDrawer: React.FC<StudioWorkspaceDrawerProps> = ({
     }
   };
 
-  const handlePhotoUpload = (e: React.ChangeEvent<HTMLInputElement>) => {
-    const file = e.target.files?.[0];
-    if (!file) return;
-    const reader = new FileReader();
-    reader.onload = () => {
-      const dataUrl = reader.result as string;
-      const uploadedScene: SceneAsset = {
-        ...activeScene,
-        id: `uploaded_${Date.now()}`,
-        title: file.name.replace(/\.[^.]+$/, ''),
-        subtitle: 'Własny obraz zaimportowany do analizy głębi 3D i sekwencji 4 kadrów',
-        imageUrl: dataUrl,
-      };
-      onAddCustomScene(uploadedScene);
-      handleDeepAnalyzeScene(dataUrl);
-    };
-    reader.readAsDataURL(file);
+  const handlePhotoUpload = async (e: React.ChangeEvent<HTMLInputElement>) => {
+    if (e.target.files && e.target.files.length > 0) {
+      await onUploadImages(e.target.files);
+      e.target.value = '';
+    }
   };
 
   const handleVideoUploadForAnalysis = (e: React.ChangeEvent<HTMLInputElement>) => {
@@ -1004,87 +1018,90 @@ export const StudioWorkspaceDrawer: React.FC<StudioWorkspaceDrawerProps> = ({
   };
 
   return (
-    <div className="fixed inset-x-0 top-14 bottom-24 z-20 flex justify-center px-4 pointer-events-none">
-      <div className="w-[min(1160px,96vw)] h-full rounded-2xl bg-[#0b0d13]/98 border border-white/15 shadow-2xl flex flex-col overflow-hidden pointer-events-auto text-[#f4f1ea]">
-        {/* Drawer Header & Tab Navigation */}
-        <div className="flex flex-wrap items-center justify-between gap-3 px-6 py-3.5 border-b border-white/10 bg-[#10131c]">
-          <div className="flex items-center gap-1.5 overflow-x-auto">
+    <div className="fixed inset-x-0 top-14 bottom-16 md:bottom-24 z-20 flex justify-center px-2 sm:px-4 pointer-events-none">
+      <div className="w-[min(1180px,98vw)] sm:w-[min(1180px,96vw)] h-full rounded-2xl bg-[#0b0d13]/98 border border-white/15 shadow-2xl flex flex-col overflow-hidden pointer-events-auto text-[#f4f1ea]">
+        {/* Drawer Header & Consolidated 5-Tab Navigation + Instant Multi-Image Upload */}
+        <div className="flex items-center justify-between gap-2 px-3 sm:px-6 py-2.5 sm:py-3.5 border-b border-white/10 bg-[#10131c]">
+          <div className="flex items-center gap-1.5 overflow-x-auto pb-0.5">
             <button
               type="button"
               onClick={() => onChangeTab('blocking3d')}
-              className={`px-3.5 py-1.5 rounded-lg text-xs font-medium transition-colors whitespace-nowrap shrink-0 cursor-pointer ${
+              className={`min-h-[38px] sm:min-h-0 px-3 py-1.5 rounded-lg text-xs font-medium transition-colors whitespace-nowrap shrink-0 cursor-pointer ${
                 activeTab === 'blocking3d'
                   ? 'bg-[#d4af37] text-[#090a0d] font-semibold'
-                  : 'text-[#e8ca64] hover:text-white border border-[#d4af37]/35'
+                  : 'text-[#e8ca64] hover:text-white border border-[#d4af37]/30'
               }`}
             >
-              Model 3D Kamery i Ujęcia Filmowe
-            </button>
-            <button
-              type="button"
-              onClick={() => onChangeTab('prompts')}
-              className={`px-3.5 py-1.5 rounded-lg text-xs font-medium transition-colors whitespace-nowrap shrink-0 cursor-pointer ${
-                activeTab === 'prompts'
-                  ? 'bg-[#d4af37] text-[#090a0d] font-semibold'
-                  : 'text-[#b8b2a6] hover:text-white'
-              }`}
-            >
-              Gotowe Odpowiedzi &amp; Efekty FX
-            </button>
-            <button
-              type="button"
-              onClick={() => onChangeTab('story')}
-              className={`px-3.5 py-1.5 rounded-lg text-xs font-medium transition-colors whitespace-nowrap shrink-0 cursor-pointer ${
-                activeTab === 'story'
-                  ? 'bg-[#d4af37] text-[#090a0d] font-semibold'
-                  : 'text-[#b8b2a6] hover:text-white'
-              }`}
-            >
-              Narracja i Historia Obrazu
+              Model 3D i Ujęcia
             </button>
             <button
               type="button"
               onClick={() => onChangeTab('sequence')}
-              className={`px-3.5 py-1.5 rounded-lg text-xs font-medium transition-colors whitespace-nowrap shrink-0 cursor-pointer ${
-                activeTab === 'sequence'
+              className={`min-h-[38px] sm:min-h-0 px-3 py-1.5 rounded-lg text-xs font-medium transition-colors whitespace-nowrap shrink-0 cursor-pointer ${
+                activeTab === 'sequence' || activeTab === 'prompts' || activeTab === 'export'
                   ? 'bg-[#d4af37] text-[#090a0d] font-semibold'
                   : 'text-[#b8b2a6] hover:text-white'
               }`}
             >
-              4 Kadry i Generowanie Wideo
+              4 Kadry, FX i Eksport
             </button>
             <button
               type="button"
-              onClick={() => onChangeTab('export')}
-              className={`px-3.5 py-1.5 rounded-lg text-xs font-medium transition-colors whitespace-nowrap shrink-0 cursor-pointer ${
-                activeTab === 'export'
+              onClick={() => onChangeTab('mobile')}
+              className={`min-h-[38px] sm:min-h-0 px-3 py-1.5 rounded-lg text-xs font-medium transition-colors whitespace-nowrap shrink-0 cursor-pointer ${
+                activeTab === 'mobile'
                   ? 'bg-[#d4af37] text-[#090a0d] font-semibold'
                   : 'text-[#b8b2a6] hover:text-white'
               }`}
             >
-              Eksport WebP / MP4 &amp; Lekki Link
+              Grafiki Mobilne 9:16
+            </button>
+            <button
+              type="button"
+              onClick={() => onChangeTab('controller')}
+              className={`min-h-[38px] sm:min-h-0 px-3 py-1.5 rounded-lg text-xs font-medium transition-colors whitespace-nowrap shrink-0 cursor-pointer ${
+                activeTab === 'controller'
+                  ? 'bg-[#d4af37] text-[#090a0d] font-semibold'
+                  : 'text-[#e8ca64] hover:text-white border border-[#d4af37]/30'
+              }`}
+            >
+              Tablet, VR i Łącznik
             </button>
             <button
               type="button"
               onClick={() => onChangeTab('director')}
-              className={`px-3.5 py-1.5 rounded-lg text-xs font-medium transition-colors whitespace-nowrap shrink-0 cursor-pointer ${
-                activeTab === 'director'
+              className={`min-h-[38px] sm:min-h-0 px-3 py-1.5 rounded-lg text-xs font-medium transition-colors whitespace-nowrap shrink-0 cursor-pointer ${
+                activeTab === 'director' || activeTab === 'story'
                   ? 'bg-[#d4af37] text-[#090a0d] font-semibold'
                   : 'text-[#b8b2a6] hover:text-white'
               }`}
             >
-              Reżyser AI &amp; Analiza
+              Reżyser AI i Narracja
             </button>
           </div>
 
-          <button
-            type="button"
-            onClick={onClose}
-            className="inline-flex items-center gap-1.5 px-3 py-1.5 rounded-lg bg-white/8 hover:bg-white/14 text-xs text-[#e5dec9] hover:text-white transition-colors whitespace-nowrap shrink-0 cursor-pointer"
-          >
-            <X className="w-3.5 h-3.5" />
-            <span>Zamknij panel (Widok 3D)</span>
-          </button>
+          <div className="flex items-center gap-2 shrink-0">
+            <label className="min-h-[38px] sm:min-h-0 inline-flex items-center gap-1.5 px-3 py-1.5 rounded-lg bg-[#d4af37]/16 hover:bg-[#d4af37]/26 border border-[#d4af37]/45 text-xs font-semibold text-[#e8ca64] whitespace-nowrap shrink-0 cursor-pointer">
+              <ImagePlus className="w-3.5 h-3.5 text-[#d4af37]" />
+              <span className="hidden sm:inline">+ Wgraj obrazy</span>
+              <input
+                type="file"
+                accept="image/*"
+                multiple
+                onChange={handlePhotoUpload}
+                className="hidden"
+              />
+            </label>
+
+            <button
+              type="button"
+              onClick={onClose}
+              className="min-h-[38px] sm:min-h-0 inline-flex items-center gap-1.5 px-2.5 sm:px-3 py-1.5 rounded-lg bg-white/8 hover:bg-white/14 text-xs text-[#e5dec9] hover:text-white transition-colors whitespace-nowrap shrink-0 cursor-pointer"
+            >
+              <X className="w-4 h-4 sm:w-3.5 sm:h-3.5" />
+              <span className="hidden sm:inline">Widok 3D</span>
+            </button>
+          </div>
         </div>
 
         {/* Live Microphone Recording / Status Banner */}
@@ -1143,7 +1160,53 @@ export const StudioWorkspaceDrawer: React.FC<StudioWorkspaceDrawerProps> = ({
         )}
 
         {/* Drawer Body */}
-        <div className="flex-1 overflow-y-auto p-6 space-y-6">
+        <div className="flex-1 overflow-y-auto p-3.5 sm:p-6 space-y-6">
+          {/* Inline Sub-Navigation when inside grouped Production/FX/Export or Director/Story section */}
+          {(activeTab === 'sequence' || activeTab === 'prompts' || activeTab === 'export') && (
+            <div className="flex flex-wrap items-center gap-1.5 p-1 rounded-xl bg-[#10131c] border border-white/10 w-fit">
+              {[
+                { id: 'sequence' as DrawerTabId, label: 'Sekwencja 4 Kadrów & MP4' },
+                { id: 'prompts' as DrawerTabId, label: 'Gotowe Odpowiedzi & FX' },
+                { id: 'export' as DrawerTabId, label: 'Eksport WebP, Link & GitHub' },
+              ].map((sub) => (
+                <button
+                  key={sub.id}
+                  type="button"
+                  onClick={() => onChangeTab(sub.id)}
+                  className={`min-h-[34px] px-3 py-1 rounded-lg text-xs font-medium transition-colors cursor-pointer ${
+                    activeTab === sub.id
+                      ? 'bg-[#d4af37] text-[#090a0d] font-semibold'
+                      : 'text-[#b8b2a6] hover:text-white'
+                  }`}
+                >
+                  {sub.label}
+                </button>
+              ))}
+            </div>
+          )}
+
+          {(activeTab === 'director' || activeTab === 'story') && (
+            <div className="flex flex-wrap items-center gap-1.5 p-1 rounded-xl bg-[#10131c] border border-white/10 w-fit">
+              {[
+                { id: 'director' as DrawerTabId, label: 'Reżyser AI (Czat i Mikrofon)' },
+                { id: 'story' as DrawerTabId, label: 'Generator Narracji i Napisów' },
+              ].map((sub) => (
+                <button
+                  key={sub.id}
+                  type="button"
+                  onClick={() => onChangeTab(sub.id)}
+                  className={`min-h-[34px] px-3 py-1 rounded-lg text-xs font-medium transition-colors cursor-pointer ${
+                    activeTab === sub.id
+                      ? 'bg-[#d4af37] text-[#090a0d] font-semibold'
+                      : 'text-[#b8b2a6] hover:text-white'
+                  }`}
+                >
+                  {sub.label}
+                </button>
+              ))}
+            </div>
+          )}
+
           {/* TAB 0: 3D CAMERA BLOCKING MODEL & STANDARDIZED NARRATIVE FILM/TV SHOTS */}
           {activeTab === 'blocking3d' && (
             <DirectorPreviz3DModule
@@ -1173,6 +1236,50 @@ export const StudioWorkspaceDrawer: React.FC<StudioWorkspaceDrawerProps> = ({
                   `Przekazuję specyfikację ścieżki ruchu kamery (Stan A → Stan B) z makiety 3D do konsultacji reżyserskiej. Oceń to ujęcie pod kątem utrzymania uwagi widza i podaj finalne wskazówki oświetleniowo-optyczne:\n\n${briefText}`
                 );
               }}
+            />
+          )}
+
+          {/* TAB: MOBILE GRAPHICS GENERATOR (9:16 STORIES, WALLPAPER, 4:5, 1:1) */}
+          {activeTab === 'mobile' && (
+            <MobileGraphicsStudioModule
+              activeScene={activeScene}
+              settings={settings}
+              cameraBlocking={cameraBlocking}
+              narrative={narrative}
+              mobileSafeZonesVisible={controller.mobileSafeZonesVisible}
+              onToggleSafeZones={() =>
+                onChangeController({
+                  ...controller,
+                  mobileSafeZonesVisible: !controller.mobileSafeZonesVisible,
+                })
+              }
+            />
+          )}
+
+          {/* TAB: UNIVERSAL APP CONTROLLER, VR CAMERA RIG, TABLET PAIRING & USCP-1.0 CONNECTOR */}
+          {activeTab === 'controller' && (
+            <UniversalControllerModule
+              controller={controller}
+              onChangeController={onChangeController}
+              settings={settings}
+              onApplySettings={onApplySettings}
+              cameraBlocking={cameraBlocking}
+              onChangeCameraBlocking={onChangeCameraBlocking}
+              liveCameraRig={liveCameraRig}
+              onChangeLiveCameraRig={onChangeLiveCameraRig}
+              onCaptureVrToBlockingState={onCaptureVrToBlockingState}
+              showStoryOverlay={showStoryOverlayOnViewport}
+              onToggleStoryOverlay={onToggleStoryOverlay}
+              connectionStatus={uscpState.connectionStatus}
+              peers={uscpState.peers}
+              sessionToken={uscpState.sessionToken}
+              pinCode={uscpState.pinCode}
+              latencyMs={uscpState.latencyMs}
+              securityStatus={uscpState.securityStatus}
+              onRotateSecureSession={uscpState.rotateSecureSession}
+              onPingServerNow={uscpState.pingServerNow}
+              onForceSyncNow={uscpState.forceSyncNow}
+              onSwitchToLocalTabletMode={onSwitchToLocalTabletMode}
             />
           )}
 
@@ -2402,6 +2509,86 @@ export const StudioWorkspaceDrawer: React.FC<StudioWorkspaceDrawerProps> = ({
                         {formatBytes(lastExportInfo.sizeBytes)})
                       </div>
                     )}
+                  </div>
+                </div>
+              </div>
+
+              {/* 04. GITHUB REPOSITORY PUBLICATION DESCRIPTION & README */}
+              <div className="rounded-xl bg-[#12151e] border border-[#d4af37]/35 p-5 space-y-4">
+                <div className="flex flex-wrap items-center justify-between gap-3">
+                  <div>
+                    <h3 className="text-base font-semibold text-white">
+                      04. Pakiet Publikacyjny na GitHub (Opis About, Tagi Topics &amp; Pełne README.md)
+                    </h3>
+                    <p className="text-xs text-[#9e988c]">
+                      Gotowy opis repozytorium przygotowany do wklejenia na GitHubie (zapisany również bezpośrednio w pliku <code className="text-[#d4af37]">/README.md</code> projektu).
+                    </p>
+                  </div>
+
+                  <div className="flex flex-wrap items-center gap-2">
+                    <button
+                      type="button"
+                      onClick={() => handleCopyText('gh_about', GITHUB_SHORT_DESCRIPTION)}
+                      className="min-h-[38px] inline-flex items-center gap-1.5 px-3 py-1.5 rounded-lg bg-[#181c26] hover:bg-[#232938] border border-white/12 text-xs text-white cursor-pointer"
+                    >
+                      {copiedId === 'gh_about' ? (
+                        <Check className="w-3.5 h-3.5 text-emerald-400" />
+                      ) : (
+                        <Copy className="w-3.5 h-3.5 text-[#d4af37]" />
+                      )}
+                      <span>
+                        {copiedId === 'gh_about' ? 'Skopiowano opis About!' : 'Kopiuj opis About'}
+                      </span>
+                    </button>
+
+                    <button
+                      type="button"
+                      onClick={() => handleCopyText('gh_topics', GITHUB_TOPICS.join(', '))}
+                      className="min-h-[38px] inline-flex items-center gap-1.5 px-3 py-1.5 rounded-lg bg-[#181c26] hover:bg-[#232938] border border-white/12 text-xs text-white cursor-pointer"
+                    >
+                      {copiedId === 'gh_topics' ? (
+                        <Check className="w-3.5 h-3.5 text-emerald-400" />
+                      ) : (
+                        <Copy className="w-3.5 h-3.5 text-[#d4af37]" />
+                      )}
+                      <span>
+                        {copiedId === 'gh_topics' ? 'Skopiowano tagi!' : 'Kopiuj Topics'}
+                      </span>
+                    </button>
+
+                    <button
+                      type="button"
+                      onClick={() => handleCopyText('gh_readme', GITHUB_README_MARKDOWN)}
+                      className="min-h-[38px] inline-flex items-center gap-1.5 px-4 py-1.5 rounded-lg bg-[#d4af37] hover:bg-[#e3be42] text-xs font-semibold text-[#090a0d] cursor-pointer"
+                    >
+                      {copiedId === 'gh_readme' ? (
+                        <Check className="w-3.5 h-3.5" />
+                      ) : (
+                        <Copy className="w-3.5 h-3.5" />
+                      )}
+                      <span>
+                        {copiedId === 'gh_readme' ? 'Skopiowano pełne README.md!' : 'Kopiuj pełne README.md'}
+                      </span>
+                    </button>
+                  </div>
+                </div>
+
+                <div className="rounded-lg bg-[#090a0d] border border-white/10 p-3.5 space-y-2">
+                  <div className="text-[11px] font-semibold text-[#d4af37]">
+                    GitHub Repository Description (sekcja About):
+                  </div>
+                  <p className="text-xs text-[#eae6dc] leading-relaxed">
+                    {GITHUB_SHORT_DESCRIPTION}
+                  </p>
+                  <div className="flex flex-wrap gap-1.5 pt-1">
+                    {GITHUB_TOPICS.map((topic) => (
+                      <span
+                        key={topic}
+                        className="px-2 py-0.5 rounded bg-[#141824] border border-white/10 text-[10px] font-mono-tabular text-[#d4af37]"
+                      >
+                        #{topic}
+                      </span>
+                    ))}
                   </div>
                 </div>
               </div>

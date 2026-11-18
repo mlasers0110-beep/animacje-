@@ -118,11 +118,120 @@ export interface SceneAsset {
 
 export type DrawerTabId =
   | 'blocking3d'
+  | 'mobile'
+  | 'controller'
   | 'prompts'
   | 'story'
   | 'sequence'
   | 'export'
   | 'director';
+
+export type SwitchGroupId =
+  | 'lighting'
+  | 'optics_pbr'
+  | 'color_lut'
+  | 'camera_path_3d'
+  | 'mobile_framing';
+
+export type ElementFocusPresetId =
+  | 'all_enabled'
+  | 'focus_camera_path'
+  | 'focus_lighting'
+  | 'focus_optics'
+  | 'focus_color'
+  | 'focus_mobile'
+  | 'custom_selection';
+
+export type SpatialResponseCurve = 'linear' | 'precision_cubic' | 'logarithmic_medical';
+
+export type SpatialAxisKey =
+  | 'yawDeg'
+  | 'pitchDeg'
+  | 'rollDeg'
+  | 'dollyZ'
+  | 'panX'
+  | 'fovOffset';
+
+export type SpatialDomainProfile = 'camera_3d' | 'medical_tissue_volume' | 'custom';
+
+export interface SpatialAxisConfig {
+  key: SpatialAxisKey;
+  enabled: boolean;
+  label: string;
+  unit: string;
+  min: number;
+  max: number;
+  step: number;
+  invert: boolean;
+}
+
+export interface SpatialControllerModel {
+  id: string;
+  name: string;
+  domainProfile: SpatialDomainProfile;
+  calibratedAt: string;
+  zeroAlpha: number;
+  zeroBeta: number;
+  zeroGamma: number;
+  noiseFloorDeg: number; // measured hand/sensor micro-tremor baseline
+  deadzoneDeg: number; // auto-computed deadzone around zero point
+  maxTiltDeg: number; // measured comfortable full-scale tilt (e.g., 15°..45°)
+  sensitivityMultiplier: number; // auto-computed gain factor (0.4..3.0)
+  smoothingAlpha: number; // EMA filter coefficient (0.08..0.85, lower = smoother)
+  responseCurve: SpatialResponseCurve;
+  axes: Record<SpatialAxisKey, SpatialAxisConfig>;
+}
+
+export interface UniversalControllerConfig {
+  sessionId: string;
+  sessionToken?: string;
+  connectorId: string;
+  appNamespace: string;
+  protocolVersion: 'USCP-1.0';
+  activeFocusPreset: ElementFocusPresetId;
+  enabledGroups: Record<SwitchGroupId, boolean>;
+  show3DPathOnMainViewport: boolean;
+  mobileSafeZonesVisible: boolean;
+  autoBroadcastPostMessage: boolean;
+  spatialModel?: SpatialControllerModel;
+}
+
+export type UscpRemoteActionType =
+  | 'export_webp'
+  | 'export_mp4'
+  | 'select_scene'
+  | 'reset_settings'
+  | 'regenerate_keyframes'
+  | 'open_tab'
+  | 'capture_vr_to_state_a'
+  | 'capture_vr_to_state_b';
+
+export type LiveCameraControlSource =
+  | 'idle'
+  | 'vr_gyro'
+  | 'vr_simulator'
+  | 'potentiometer'
+  | 'hardware_gamepad'
+  | 'web_midi';
+
+export interface LiveCameraRigState {
+  enabled: boolean;
+  source: LiveCameraControlSource;
+  yawDeg: number; // -45 to +45 deg
+  pitchDeg: number; // -30 to +30 deg
+  rollDeg: number; // -25 to +25 deg
+  dollyZ: number; // -1.8 to +1.8 m
+  panX: number; // -1.8 to +1.8 m
+  fovOffset: number; // -12 to +14 deg
+  vrSensitivity: number; // 0.3 to 2.5
+  invertAxes: boolean;
+}
+
+export type MobileGraphicFormat =
+  | '9:16_story'
+  | '9:16_wallpaper'
+  | '4:5_feed'
+  | '1:1_square';
 
 export type FocalLengthOption = 18 | 24 | 35 | 50 | 85;
 

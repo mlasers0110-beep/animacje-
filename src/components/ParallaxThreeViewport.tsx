@@ -1,15 +1,30 @@
 import React, { useEffect, useRef } from 'react';
 import * as THREE from 'three';
 import { RoomEnvironment } from 'three/addons/environments/RoomEnvironment.js';
-import { SceneAsset, VisualEffectSettings, VisualFxPresetId } from '../types/studio';
+import {
+  evaluatePathEasing,
+  interpolateBlockingPose,
+} from '../data/cinematicShotsLibrary';
+import {
+  CameraBlockingConfig,
+  LiveCameraRigState,
+  SceneAsset,
+  VisualEffectSettings,
+  VisualFxPresetId,
+} from '../types/studio';
 
 interface ParallaxThreeViewportProps {
   sceneAsset: SceneAsset;
   settings: VisualEffectSettings;
+  cameraBlocking?: CameraBlockingConfig;
+  liveCameraRig?: LiveCameraRigState;
+  showCameraPathOverlay?: boolean;
   onCanvasReady?: (canvas: HTMLCanvasElement) => void;
 }
 
 const _lookAtVec = new THREE.Vector3(0, 0, 0);
+const _dummyTickObj = new THREE.Object3D();
+const _gateEuler = new THREE.Euler(0, 0, 0, 'YXZ');
 
 function fxPresetToIndex(id: VisualFxPresetId): number {
   switch (id) {
@@ -26,6 +41,90 @@ function fxPresetToIndex(id: VisualFxPresetId): number {
     default:
       return 0;
   }
+}
+
+/**
+ * Maps architectural lobby coordinates (meters) from `cameraBlocking` into the 3D screen stage
+ * in front of the depth-relief plane (width 8.8, height 4.95 at z = 0, camera at z = 5.32).
+ */
+function mapBlockingPoseToViewport3D(pose: {
+  x: number;
+  y: number;
+  z: number;
+}): THREE.Vector3 {
+  const vx = THREE.MathUtils.clamp(pose.x * 0.54, -3.35, 3.35);
+  const vy = THREE.MathUtils.clamp((pose.y - 1.52) * 0.88, -1.55, 1.55);
+  const vz = THREE.MathUtils.clamp(0.52 + (5.2 - pose.z) * 0.21, 0.36, 2.22);
+  return new THREE.Vector3(vx, vy, vz);
+}
+
+function createKeyframeBadgeSprite(
+  label: string,
+  borderHex: string,
+  maxAnisotropy: number
+): { sprite: THREE.Sprite; texture: THREE.CanvasTexture; material: THREE.SpriteMaterial } {
+  const canvas = document.createElement('canvas');
+  canvas.width = 256;
+  canvas.height = 64;
+  const ctx = canvas.getContext('2d')!;
+
+  ctx.fillStyle = 'rgba(9, 10, 14, 0.88)';
+  ctx.beginPath();
+  ctx.roundRect(4, 6, 248, 52, 12);
+  ctx.fill();
+
+  ctx.strokeStyle = borderHex;
+  ctx.lineWidth = 3;
+  ctx.beginPath();
+  ctx.roundRect(4, 6, 248, 52, 12);
+  ctx.stroke();
+
+  ctx.fillStyle = '#f4f1ea';
+  ctx.font = '600 22px "Plus Jakarta Sans", sans-serif';
+  ctx.textAlign = 'center';
+  ctx.textBaseline = 'middle';
+  ctx.fillText(label, 128, 33);
+
+  const texture = new THREE.CanvasTexture(canvas);
+  texture.colorSpace = THREE.SRGBColorSpace;
+  texture.anisotropy = maxAnisotropy;
+
+  const material = new THREE.SpriteMaterial({
+    map: texture,
+    transparent: true,
+    depthTest: false,
+    depthWrite: false,
+  });
+
+  const sprite = new THREE.Sprite(material);
+  sprite.scale.set(0.76, 0.19, 1);
+  sprite.renderOrder = 12;
+  return { sprite, texture, material };
+}
+
+function buildMiniViewportGate(hexColor: number): {
+  loop: THREE.LineLoop;
+  geo: THREE.BufferGeometry;
+  mat: THREE.LineBasicMaterial;
+} {
+  const hw = 0.19;
+  const hh = 0.107;
+  const pts = [
+    new THREE.Vector3(-hw, hh, -0.14),
+    new THREE.Vector3(hw, hh, -0.14),
+    new THREE.Vector3(hw, -hh, -0.14),
+    new THREE.Vector3(-hw, -hh, -0.14),
+  ];
+  const geo = new THREE.BufferGeometry().setFromPoints(pts);
+  const mat = new THREE.LineBasicMaterial({
+    color: hexColor,
+    transparent: true,
+    opacity: 0.88,
+    depthTest: false,
+  });
+  const loop = new THREE.LineLoop(geo, mat);
+  loop.renderOrder = 10;
+  return { loop, geo, mat };
 }
 
 const VERTEX_SHADER = `
@@ -175,7 +274,10 @@ function createRadialContactShadowTexture(): THREE.CanvasTexture {
   return tex;
 }
 
-function createArchitecturalPropsGroup(isSoftwareGl: boolean): THREE.Group {
+function createArchitecturalPropsGroup(
+  isSoftwareGl: boolean,
+  disposables: Array<{ dispose: () => void }>
+): THREE.Group {
   const rootGroup = new THREE.Group();
 
   const haloGroup = new THREE.Group();
@@ -281,18 +383,35 @@ function createArchitecturalPropsGroup(isSoftwareGl: boolean): THREE.Group {
   sculptureGroup.add(waveMesh);
 
   const shadowTex = createRadialContactShadowTexture();
-  const shadowPlane = new THREE.Mesh(
-    new THREE.PlaneGeometry(1.1, 1.1),
-    new THREE.MeshBasicMaterial({
-      map: shadowTex,
-      transparent: true,
-      depthWrite: false,
-      opacity: 0.48,
-    })
-  );
-  shadowPlane.rotation.x = -Math.PI / 2;
+  const shadowGeo = new THREE.PlaneGeometry(1.1, 1.1);
+  const shadowMat = new THREE.MeshBasicMaterial({
+    map: shadowTex,
+    transparent: true,
+    depthWrite: false,
+    opacity: 0.48,
+  });
+  const shadowPlane = new THREE.Mesh(shadowGeo, shadowMat);
+  shadowPlane.rotation.x = -Math.PI * 2 * 0.25;
   shadowPlane.position.y = 0.005;
   sculptureGroup.add(shadowPlane);
+
+  disposables.push(
+    goldMaterial,
+    darkBronzeMaterial,
+    ledEmissiveMaterial,
+    outerRingGeo,
+    innerLedGeo,
+    trimRingGeo,
+    cableGeo,
+    anchorGeo,
+    plinthGeo,
+    plinthMat,
+    extrudeGeo,
+    chromeMat,
+    shadowTex,
+    shadowGeo,
+    shadowMat
+  );
 
   rootGroup.add(sculptureGroup);
   return rootGroup;
@@ -301,13 +420,31 @@ function createArchitecturalPropsGroup(isSoftwareGl: boolean): THREE.Group {
 export const ParallaxThreeViewport: React.FC<ParallaxThreeViewportProps> = ({
   sceneAsset,
   settings,
+  cameraBlocking,
+  liveCameraRig,
+  showCameraPathOverlay = true,
   onCanvasReady,
 }) => {
   const canvasMountRef = useRef<HTMLDivElement>(null);
+  const fpsValueRef = useRef<HTMLSpanElement>(null);
+  const fpsStatusRef = useRef<HTMLSpanElement>(null);
   const settingsRef = useRef<VisualEffectSettings>(settings);
+  const blockingRef = useRef<CameraBlockingConfig | undefined>(cameraBlocking);
+  blockingRef.current = cameraBlocking;
+  const liveRigRef = useRef<LiveCameraRigState | undefined>(liveCameraRig);
+  liveRigRef.current = liveCameraRig;
+  const showPathRef = useRef<boolean>(showCameraPathOverlay);
+  showPathRef.current = showCameraPathOverlay;
+
   const materialRef = useRef<THREE.ShaderMaterial | null>(null);
   const propsGroupRef = useRef<THREE.Group | null>(null);
   const textureLoaderRef = useRef<THREE.TextureLoader>(new THREE.TextureLoader());
+
+  const viewportApiRef = useRef<{
+    requestRender: () => void;
+    rebuildCameraPathLine: () => void;
+    applyLiveCameraPose: () => void;
+  } | null>(null);
 
   useEffect(() => {
     settingsRef.current = settings;
@@ -326,7 +463,18 @@ export const ParallaxThreeViewport: React.FC<ParallaxThreeViewportProps> = ({
     if (propsGroupRef.current) {
       propsGroupRef.current.visible = settings.show3DProps;
     }
+    viewportApiRef.current?.requestRender();
   }, [settings]);
+
+  useEffect(() => {
+    viewportApiRef.current?.rebuildCameraPathLine();
+    viewportApiRef.current?.requestRender();
+  }, [cameraBlocking, showCameraPathOverlay]);
+
+  useEffect(() => {
+    viewportApiRef.current?.applyLiveCameraPose();
+    viewportApiRef.current?.requestRender();
+  }, [liveCameraRig]);
 
   useEffect(() => {
     if (!materialRef.current) return;
@@ -347,6 +495,7 @@ export const ParallaxThreeViewport: React.FC<ParallaxThreeViewportProps> = ({
         if (oldTex && oldTex !== tex) {
           oldTex.dispose();
         }
+        viewportApiRef.current?.requestRender();
       }
     });
   }, [sceneAsset]);
@@ -385,13 +534,18 @@ export const ParallaxThreeViewport: React.FC<ParallaxThreeViewportProps> = ({
     container.appendChild(renderer.domElement);
     onCanvasReady?.(renderer.domElement);
 
+    const disposables: Array<{ dispose: () => void }> = [];
+    const maxAniso = renderer.capabilities.getMaxAnisotropy();
+
     const scene = new THREE.Scene();
     scene.background = new THREE.Color('#090a0d');
     scene.fog = new THREE.FogExp2('#090a0d', 0.045);
 
     const pmremGenerator = new THREE.PMREMGenerator(renderer);
-    scene.environment = pmremGenerator.fromScene(new RoomEnvironment(), 0.04).texture;
+    const envRT = pmremGenerator.fromScene(new RoomEnvironment(), 0.04);
+    scene.environment = envRT.texture;
     pmremGenerator.dispose();
+    disposables.push(envRT);
 
     const camera = new THREE.PerspectiveCamera(
       42,
@@ -453,25 +607,402 @@ export const ParallaxThreeViewport: React.FC<ParallaxThreeViewportProps> = ({
       fragmentShader: FRAGMENT_SHADER,
     });
     materialRef.current = shaderMat;
+    disposables.push(planeGeo, shaderMat);
 
     const depthMesh = new THREE.Mesh(planeGeo, shaderMat);
     scene.add(depthMesh);
 
-    textureLoaderRef.current.load(sceneAsset.imageUrl, (loadedTex) => {
-      loadedTex.colorSpace = THREE.SRGBColorSpace;
-      loadedTex.anisotropy = renderer.capabilities.getMaxAnisotropy();
-      shaderMat.uniforms.uTexture.value = loadedTex;
-      placeholderTex.dispose();
-    });
-
-    const propsGroup = createArchitecturalPropsGroup(isSoftwareGl);
+    const propsGroup = createArchitecturalPropsGroup(isSoftwareGl, disposables);
     propsGroup.visible = settingsRef.current.show3DProps;
     propsGroupRef.current = propsGroup;
     scene.add(propsGroup);
 
+    // =========================================================================
+    // 3D CAMERA PATH OVERLAY GROUP (Drawn from `cameraBlocking` across 4 frames)
+    // =========================================================================
+    const cameraPathGroup = new THREE.Group();
+    cameraPathGroup.renderOrder = 8;
+    scene.add(cameraPathGroup);
+
+    const pathTubeMat = new THREE.MeshStandardMaterial({
+      color: new THREE.Color('#d4af37'),
+      emissive: new THREE.Color('#d4af37'),
+      emissiveIntensity: 0.65,
+      roughness: 0.25,
+      metalness: 0.82,
+      transparent: true,
+      opacity: 0.88,
+      depthTest: false,
+    });
+    const pathCoreLineMat = new THREE.LineBasicMaterial({
+      color: new THREE.Color('#fef08a'),
+      transparent: true,
+      opacity: 0.95,
+      depthTest: false,
+    });
+    const sightRayMat = new THREE.LineBasicMaterial({
+      color: new THREE.Color('#38bdf8'),
+      transparent: true,
+      opacity: 0.48,
+      depthTest: false,
+    });
+    disposables.push(pathTubeMat, pathCoreLineMat, sightRayMat);
+
+    let pathTubeMesh: THREE.Mesh | null = null;
+    let pathCoreLine: THREE.Line | null = null;
+
+    // 24 Velocity-spaced interpolation ticks along the 3D path (InstancedMesh)
+    const tickCount = 24;
+    const tickGeo = new THREE.SphereGeometry(0.022, 10, 10);
+    const tickMat = new THREE.MeshStandardMaterial({
+      color: new THREE.Color('#fef08a'),
+      emissive: new THREE.Color('#d4af37'),
+      emissiveIntensity: 0.85,
+      depthTest: false,
+    });
+    disposables.push(tickGeo, tickMat);
+    const velocityTicksMesh = new THREE.InstancedMesh(tickGeo, tickMat, tickCount);
+    velocityTicksMesh.frustumCulled = false;
+    velocityTicksMesh.renderOrder = 9;
+    cameraPathGroup.add(velocityTicksMesh);
+
+    // 4 Keyframe Nodes (0%, 33%, 67%, 100%) + Mini 16:9 Viewfinder Gates + Labels
+    const kfSphereGeo = new THREE.SphereGeometry(0.052, 16, 16);
+    disposables.push(kfSphereGeo);
+
+    const kfBadgeSpecs = [
+      { label: 'A · K01 (0%)', hexNum: 0x10b981, hexStr: '#10b981' },
+      { label: 'K02 (33%)', hexNum: 0xd4af37, hexStr: '#d4af37' },
+      { label: 'K03 (67%)', hexNum: 0xd4af37, hexStr: '#d4af37' },
+      { label: 'B · K04 (100%)', hexNum: 0xf59e0b, hexStr: '#f59e0b' },
+    ];
+
+    const keyframeAnchors: Array<{
+      group: THREE.Group;
+      gateLoop: THREE.LineLoop;
+      sprite: THREE.Sprite;
+    }> = [];
+
+    kfBadgeSpecs.forEach((spec) => {
+      const nodeGroup = new THREE.Group();
+      const nodeMat = new THREE.MeshStandardMaterial({
+        color: spec.hexNum,
+        emissive: spec.hexNum,
+        emissiveIntensity: 0.78,
+        depthTest: false,
+      });
+      disposables.push(nodeMat);
+
+      const sphere = new THREE.Mesh(kfSphereGeo, nodeMat);
+      sphere.renderOrder = 11;
+
+      const gate = buildMiniViewportGate(spec.hexNum);
+      disposables.push(gate.geo, gate.mat);
+
+      const badge = createKeyframeBadgeSprite(spec.label, spec.hexStr, maxAniso);
+      badge.sprite.position.set(0, 0.21, 0);
+      disposables.push(badge.texture, badge.material);
+
+      nodeGroup.add(sphere, gate.loop, badge.sprite);
+      cameraPathGroup.add(nodeGroup);
+      keyframeAnchors.push({
+        group: nodeGroup,
+        gateLoop: gate.loop,
+        sprite: badge.sprite,
+      });
+    });
+
+    // Target Focal Anchor & 2 Sight Rays (State A -> Target, State B -> Target)
+    const targetAnchorMat = new THREE.MeshStandardMaterial({
+      color: 0x38bdf8,
+      emissive: 0x0284c7,
+      emissiveIntensity: 0.9,
+      depthTest: false,
+    });
+    const targetRingGeo = new THREE.TorusGeometry(0.11, 0.012, 12, 32);
+    disposables.push(targetAnchorMat, targetRingGeo);
+    const targetRingMesh = new THREE.Mesh(targetRingGeo, targetAnchorMat);
+    targetRingMesh.renderOrder = 10;
+    cameraPathGroup.add(targetRingMesh);
+
+    const sightPositions = new Float32Array(12); // 4 vertices (2 segments: A->Target, B->Target)
+    const sightGeo = new THREE.BufferGeometry();
+    sightGeo.setAttribute('position', new THREE.BufferAttribute(sightPositions, 3));
+    disposables.push(sightGeo);
+    const sightSegments = new THREE.LineSegments(sightGeo, sightRayMat);
+    sightSegments.renderOrder = 8;
+    cameraPathGroup.add(sightSegments);
+
+    const rebuildCameraPathLine = () => {
+      const b = blockingRef.current;
+      const visible = Boolean(b && showPathRef.current);
+      cameraPathGroup.visible = visible;
+      if (!b || !visible) return;
+
+      // Sample 37 points along the interpolated camera movement curve
+      const sampleCount = 36;
+      const curvePoints: THREE.Vector3[] = [];
+      for (let i = 0; i <= sampleCount; i++) {
+        const u = i / sampleCount;
+        const p = interpolateBlockingPose(b, u);
+        curvePoints.push(mapBlockingPoseToViewport3D(p));
+      }
+
+      // Ensure non-degenerate curve even if State A and State B coincide
+      if (curvePoints[0].distanceTo(curvePoints[curvePoints.length - 1]) < 0.02) {
+        curvePoints[curvePoints.length - 1].x += 0.03;
+      }
+
+      const catmullCurve = new THREE.CatmullRomCurve3(curvePoints);
+
+      if (pathTubeMesh) {
+        cameraPathGroup.remove(pathTubeMesh);
+        pathTubeMesh.geometry.dispose();
+        pathTubeMesh = null;
+      }
+      if (pathCoreLine) {
+        cameraPathGroup.remove(pathCoreLine);
+        pathCoreLine.geometry.dispose();
+        pathCoreLine = null;
+      }
+
+      const tubeGeo = new THREE.TubeGeometry(catmullCurve, 48, 0.014, 8, false);
+      pathTubeMesh = new THREE.Mesh(tubeGeo, pathTubeMat);
+      pathTubeMesh.renderOrder = 9;
+      cameraPathGroup.add(pathTubeMesh);
+
+      const lineGeo = new THREE.BufferGeometry().setFromPoints(
+        catmullCurve.getPoints(64)
+      );
+      pathCoreLine = new THREE.Line(lineGeo, pathCoreLineMat);
+      pathCoreLine.renderOrder = 10;
+      cameraPathGroup.add(pathCoreLine);
+
+      // Position 24 velocity-paced easing markers along the curve
+      const smoothing =
+        b.smoothingFactor ?? (b.easingStyle === 'linear_constant' ? 0 : 65);
+      for (let i = 0; i < tickCount; i++) {
+        const rawT = i / (tickCount - 1);
+        const easedT = evaluatePathEasing(rawT, b.easingStyle, smoothing);
+        const pt = catmullCurve.getPoint(THREE.MathUtils.clamp(easedT, 0, 1));
+        _dummyTickObj.position.copy(pt);
+        _dummyTickObj.rotation.set(0, 0, 0);
+        _dummyTickObj.scale.setScalar(1);
+        _dummyTickObj.updateMatrix();
+        velocityTicksMesh.setMatrixAt(i, _dummyTickObj.matrix);
+      }
+      velocityTicksMesh.instanceMatrix.needsUpdate = true;
+      velocityTicksMesh.computeBoundingSphere();
+
+      // Update the 4 Keyframe Nodes (0%, 33%, 67%, 100%)
+      [0, 1 / 3, 2 / 3, 1].forEach((frac, idx) => {
+        const kfPose = interpolateBlockingPose(b, frac);
+        const pos3D = mapBlockingPoseToViewport3D(kfPose);
+        const anchor = keyframeAnchors[idx];
+        anchor.group.position.copy(pos3D);
+
+        _gateEuler.set(
+          THREE.MathUtils.degToRad(kfPose.tiltDeg * 0.45),
+          THREE.MathUtils.degToRad(kfPose.panDeg * 0.45),
+          THREE.MathUtils.degToRad(kfPose.rollDeg)
+        );
+        anchor.gateLoop.quaternion.setFromEuler(_gateEuler);
+        const focalScale = THREE.MathUtils.clamp(35 / Math.max(18, kfPose.focalMm), 0.65, 1.35);
+        anchor.gateLoop.scale.setScalar(focalScale);
+      });
+
+      // Update Target Focal Point & Sightlines
+      const target3D = new THREE.Vector3(
+        THREE.MathUtils.clamp(b.targetPoint.x * 0.52, -3.5, 3.5),
+        THREE.MathUtils.clamp((b.targetPoint.y - 1.52) * 0.85, -1.6, 1.6),
+        0.28
+      );
+      targetRingMesh.position.copy(target3D);
+      targetRingMesh.visible = b.lockFramingToTarget;
+      sightSegments.visible = b.lockFramingToTarget;
+
+      if (b.lockFramingToTarget) {
+        const start3D = keyframeAnchors[0].group.position;
+        const end3D = keyframeAnchors[3].group.position;
+        const attr = sightGeo.getAttribute('position') as THREE.BufferAttribute;
+        attr.setXYZ(0, start3D.x, start3D.y, start3D.z);
+        attr.setXYZ(1, target3D.x, target3D.y, target3D.z);
+        attr.setXYZ(2, end3D.x, end3D.y, end3D.z);
+        attr.setXYZ(3, target3D.x, target3D.y, target3D.z);
+        attr.needsUpdate = true;
+        sightGeo.computeBoundingSphere();
+      }
+    };
+
+    rebuildCameraPathLine();
+
+    let frameId = 0;
+    let idleTimerId = 0;
+    let renderBusy = false;
+    let renderDirty = false;
+    const recentRenderTimestamps: number[] = [];
+    let lastRenderTimestamp = 0;
+    let lastHudUpdate = 0;
+    let smoothedFps = isSoftwareGl ? 15 : 60;
+    let lastRenderMs = 0;
+
+    const writeFpsHud = (fps: number, ms: number, isIdle: boolean) => {
+      if (fpsValueRef.current) {
+        fpsValueRef.current.textContent = `${Math.max(1, Math.round(fps))} FPS`;
+        fpsValueRef.current.style.color =
+          fps >= 45 ? '#34d399' : fps >= 24 ? '#d4af37' : '#f87171';
+      }
+      if (fpsStatusRef.current) {
+        fpsStatusRef.current.textContent = isIdle
+          ? `· ${ms.toFixed(1)} ms · gotowy`
+          : `· ${ms.toFixed(1)} ms`;
+      }
+    };
+
+    function afterDraw(cb: () => void) {
+      const gl = renderer.getContext() as WebGL2RenderingContext;
+      const sync =
+        gl && typeof gl.fenceSync === 'function'
+          ? gl.fenceSync(gl.SYNC_GPU_COMMANDS_COMPLETE, 0)
+          : null;
+      if (gl) gl.flush();
+      const poll = () => {
+        const state = sync && gl.getSyncParameter(sync, gl.SYNC_STATUS);
+        if (state === gl.UNSIGNALED) {
+          frameId = window.setTimeout(poll, 5);
+        } else {
+          if (sync) gl.deleteSync(sync);
+          frameId = window.setTimeout(cb, 80);
+        }
+      };
+      frameId = window.setTimeout(poll, 5);
+    }
+
+    function requestRender() {
+      if (renderBusy) {
+        renderDirty = true;
+        return;
+      }
+      renderBusy = true;
+      frameId = requestAnimationFrame(() => {
+        renderDirty = false;
+        const t0 = performance.now();
+        renderer.render(scene, camera);
+        const t1 = performance.now();
+
+        lastRenderMs = Math.max(0.1, t1 - t0);
+        recentRenderTimestamps.push(t1);
+        while (
+          recentRenderTimestamps.length > 0 &&
+          recentRenderTimestamps[0] < t1 - 1000
+        ) {
+          recentRenderTimestamps.shift();
+        }
+
+        if (lastRenderTimestamp > 0) {
+          const delta = t1 - lastRenderTimestamp;
+          if (delta > 0 && delta < 500) {
+            const instantFps = Math.min(120, 1000 / Math.max(8.33, delta));
+            smoothedFps = smoothedFps * 0.7 + instantFps * 0.3;
+          } else {
+            const theoreticalFps = Math.min(
+              isSoftwareGl ? 30 : 60,
+              1000 / Math.max(16.67, lastRenderMs)
+            );
+            smoothedFps = theoreticalFps;
+          }
+        } else {
+          smoothedFps = Math.min(
+            isSoftwareGl ? 30 : 60,
+            1000 / Math.max(16.67, lastRenderMs)
+          );
+        }
+        lastRenderTimestamp = t1;
+
+        if (t1 - lastHudUpdate >= 160) {
+          lastHudUpdate = t1;
+          const displayFps =
+            recentRenderTimestamps.length >= 6
+              ? Math.max(recentRenderTimestamps.length, Math.round(smoothedFps))
+              : smoothedFps;
+          writeFpsHud(displayFps, lastRenderMs, false);
+        }
+
+        window.clearTimeout(idleTimerId);
+        idleTimerId = window.setTimeout(() => {
+          writeFpsHud(smoothedFps, lastRenderMs, true);
+        }, 900);
+
+        const done = () => {
+          renderBusy = false;
+          if (renderDirty) requestRender();
+        };
+        if (isSoftwareGl) afterDraw(done);
+        else done();
+      });
+    }
+
+    const applyLiveCameraPose = () => {
+      const rig = liveRigRef.current;
+      if (!rig || !rig.enabled) {
+        camera.position.set(0, 0, 5.32);
+        camera.rotation.order = 'YXZ';
+        camera.rotation.set(0, 0, 0);
+        if (Math.abs(camera.fov - 42) > 0.05) {
+          camera.fov = 42;
+          camera.updateProjectionMatrix();
+        }
+        return;
+      }
+
+      const sign = rig.invertAxes ? -1 : 1;
+      camera.position.set(
+        THREE.MathUtils.clamp(rig.panX * 0.9, -2.2, 2.2),
+        THREE.MathUtils.clamp(rig.pitchDeg * 0.012 * sign, -1.1, 1.1),
+        THREE.MathUtils.clamp(5.32 - rig.dollyZ * 1.15, 2.8, 7.6)
+      );
+      camera.rotation.order = 'YXZ';
+      camera.rotation.set(
+        THREE.MathUtils.degToRad(rig.pitchDeg * 0.55 * sign),
+        THREE.MathUtils.degToRad(-rig.yawDeg * 0.65 * sign),
+        THREE.MathUtils.degToRad(rig.rollDeg * sign)
+      );
+      const nextFov = THREE.MathUtils.clamp(42 - rig.fovOffset, 22, 74);
+      if (Math.abs(camera.fov - nextFov) > 0.05) {
+        camera.fov = nextFov;
+        camera.updateProjectionMatrix();
+      }
+    };
+
+    applyLiveCameraPose();
+
+    viewportApiRef.current = {
+      requestRender,
+      rebuildCameraPathLine,
+      applyLiveCameraPose,
+    };
+
+    textureLoaderRef.current.load(sceneAsset.imageUrl, (loadedTex) => {
+      loadedTex.colorSpace = THREE.SRGBColorSpace;
+      loadedTex.anisotropy = maxAniso;
+      shaderMat.uniforms.uTexture.value = loadedTex;
+      placeholderTex.dispose();
+      requestRender();
+    });
+
     if (!isSoftwareGl) {
       renderer.compile(scene, camera);
     }
+
+    const onContextLost = (e: Event) => {
+      e.preventDefault();
+    };
+    const onContextRestored = () => {
+      rebuildCameraPathLine();
+      requestRender();
+    };
+    renderer.domElement.addEventListener('webglcontextlost', onContextLost);
+    renderer.domElement.addEventListener('webglcontextrestored', onContextRestored);
 
     const onResize = () => {
       const w = container.clientWidth || window.innerWidth;
@@ -479,55 +1010,69 @@ export const ParallaxThreeViewport: React.FC<ParallaxThreeViewportProps> = ({
       camera.aspect = w / h;
       camera.updateProjectionMatrix();
       renderer.setSize(w, h);
+      requestRender();
     };
 
     window.addEventListener('resize', onResize);
-
-    let frameId = 0;
-
-    function afterDraw(cb: () => void) {
-      const gl = renderer.getContext() as WebGL2RenderingContext;
-      const sync = gl.fenceSync ? gl.fenceSync(gl.SYNC_GPU_COMMANDS_COMPLETE, 0) : null;
-      gl.flush();
-      const poll = () => {
-        const state = sync && gl.getSyncParameter(sync, gl.SYNC_STATUS);
-        if (state === gl.UNSIGNALED) {
-          frameId = window.setTimeout(poll, 5);
-        } else {
-          if (sync) gl.deleteSync(sync);
-          frameId = window.setTimeout(cb, 120);
-        }
-      };
-      frameId = window.setTimeout(poll, 5);
-    }
-
-    function tick() {
-      renderer.render(scene, camera);
-
-      if (isSoftwareGl) {
-        afterDraw(tick);
-      } else {
-        frameId = requestAnimationFrame(tick);
-      }
-    }
-
-    tick();
+    requestRender();
 
     return () => {
       window.removeEventListener('resize', onResize);
+      renderer.domElement.removeEventListener('webglcontextlost', onContextLost);
+      renderer.domElement.removeEventListener('webglcontextrestored', onContextRestored);
       cancelAnimationFrame(frameId);
       clearTimeout(frameId);
-      planeGeo.dispose();
-      shaderMat.dispose();
+      clearTimeout(idleTimerId);
+      if (pathTubeMesh) pathTubeMesh.geometry.dispose();
+      if (pathCoreLine) pathCoreLine.geometry.dispose();
+      const activeTex = shaderMat.uniforms.uTexture.value;
+      if (activeTex) activeTex.dispose();
+      disposables.forEach((d) => d.dispose());
       renderer.dispose();
     };
   }, []);
 
   return (
-    <div
-      ref={canvasMountRef}
-      className="fixed inset-0 w-screen h-screen overflow-hidden bg-[#090a0d] z-0"
-      aria-label="Widok studyjny głębi 3D i efektów wizualnych Bujok Medical"
-    />
+    <>
+      <div
+        ref={canvasMountRef}
+        className="fixed inset-0 w-screen h-screen overflow-hidden bg-[#090a0d] z-0"
+        aria-label="Widok studyjny głębi 3D, efektów wizualnych i linii ścieżki kamery 3D Bujok Medical"
+      />
+      <div className="fixed top-[62px] right-3 sm:right-6 z-10 pointer-events-none flex flex-col items-end gap-1.5">
+        <div
+          aria-label="Licznik wydajności renderingu 3D FPS"
+          title="Wydajność renderingu WebGL (klatki na sekundę oraz czas klatki w ms)"
+          className="inline-flex items-center gap-1.5 px-2.5 py-1 rounded-md bg-[#090a0d]/85 border border-white/10 text-[11px] font-mono-tabular text-[#9e988c]"
+        >
+          <span ref={fpsValueRef} className="font-semibold text-[#34d399]">
+            60 FPS
+          </span>
+          <span ref={fpsStatusRef}>· -- ms</span>
+        </div>
+
+        {liveCameraRig?.enabled && (
+          <div className="inline-flex items-center gap-1.5 px-2.5 py-1 rounded-md bg-[#090a0d]/90 border border-[#d4af37]/45 text-[11px] font-mono-tabular text-[#e8ca64]">
+            <span>
+              {liveCameraRig.source === 'vr_gyro'
+                ? 'VR Żyroskop'
+                : liveCameraRig.source === 'vr_simulator'
+                  ? 'Symulacja VR'
+                  : liveCameraRig.source === 'web_midi'
+                    ? 'MIDI Potencjometry'
+                    : liveCameraRig.source === 'hardware_gamepad'
+                      ? 'Pad / Kontroler'
+                      : 'Potencjometry'}
+            </span>
+            <span aria-hidden="true">·</span>
+            <span>
+              Y {liveCameraRig.yawDeg >= 0 ? '+' : ''}
+              {Math.round(liveCameraRig.yawDeg)}° P {liveCameraRig.pitchDeg >= 0 ? '+' : ''}
+              {Math.round(liveCameraRig.pitchDeg)}°
+            </span>
+          </div>
+        )}
+      </div>
+    </>
   );
 };

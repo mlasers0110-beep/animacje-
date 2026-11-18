@@ -1,9 +1,12 @@
+import crypto from 'crypto';
 import dotenv from 'dotenv';
 import express from 'express';
 import fs from 'fs';
+import http from 'http';
 import path from 'path';
 import { fileURLToPath } from 'url';
 import { createServer as createViteServer } from 'vite';
+import { WebSocket, WebSocketServer } from 'ws';
 import { GoogleGenAI, ThinkingLevel, Type } from '@google/genai';
 
 dotenv.config();
@@ -107,11 +110,298 @@ async function generateContentWithFallback(
   throw lastError;
 }
 
+interface UscpClientMeta {
+  ws: WebSocket;
+  clientId: string;
+  role: 'host' | 'tablet' | 'app';
+  appNamespace: string;
+  isAlive: boolean;
+  rateWindowStart: number;
+  msgCountInWindow: number;
+}
+
+interface UscpSessionState {
+  sessionId: string;
+  pairToken: string;
+  pinCode: string;
+  hmacSecret: string;
+  seq: number;
+  latestPacket: Record<string, any> | null;
+  sceneCatalog: Array<{ id: string; title: string; subtitle: string; previewThumb?: string }>;
+  activeSceneId: string;
+  clients: Set<UscpClientMeta>;
+  updatedAt: number;
+}
+
+function safeEqualToken(a: string | undefined | null, b: string | undefined | null): boolean {
+  if (!a || !b) return false;
+  const bufA = Buffer.from(String(a), 'utf8');
+  const bufB = Buffer.from(String(b), 'utf8');
+  if (bufA.length !== bufB.length) return false;
+  return crypto.timingSafeEqual(bufA, bufB);
+}
+
+function sanitizeJsonObject<T>(val: T, depth = 0): T {
+  if (depth > 8 || val === null || typeof val !== 'object') return val;
+  if (Array.isArray(val)) {
+    return val.slice(0, 64).map((item) => sanitizeJsonObject(item, depth + 1)) as unknown as T;
+  }
+  const clean: Record<string, unknown> = {};
+  for (const [k, v] of Object.entries(val as Record<string, unknown>)) {
+    if (k === '__proto__' || k === 'constructor' || k === 'prototype') continue;
+    clean[k] = sanitizeJsonObject(v, depth + 1);
+  }
+  return clean as T;
+}
+
+function createPinCode(): string {
+  const chars = 'ABCDEFGHJKLMNPQRSTUVWXYZ23456789';
+  const bytes = crypto.randomBytes(6);
+  let out = '';
+  for (let i = 0; i < 6; i++) {
+    out += chars[bytes[i] % chars.length];
+  }
+  return out;
+}
+
 async function startServer() {
   const app = express();
   const PORT = 3000;
 
   app.use(express.json({ limit: '50mb' }));
+
+  // =========================================================================
+  // HARDENED MULTI-APP & SECOND-SCREEN CONNECTOR HUB (USCP-1.0 SECURE TRANSPORT)
+  // =========================================================================
+  const uscpSessions = new Map<string, UscpSessionState>();
+
+  const getOrCreateSession = (rawId: string, preferredToken?: string): UscpSessionState => {
+    const sessionId = (rawId || 'BUJOK-STUDIO')
+      .trim()
+      .toUpperCase()
+      .replace(/[^A-Z0-9_-]/g, '')
+      .slice(0, 32) || 'BUJOK-STUDIO';
+    let session = uscpSessions.get(sessionId);
+    if (!session) {
+      session = {
+        sessionId,
+        pairToken:
+          preferredToken && preferredToken.length >= 8
+            ? preferredToken.slice(0, 64)
+            : crypto.randomBytes(12).toString('hex'),
+        pinCode: createPinCode(),
+        hmacSecret: crypto.randomBytes(16).toString('hex'),
+        seq: 0,
+        latestPacket: null,
+        sceneCatalog: [],
+        activeSceneId: '',
+        clients: new Set(),
+        updatedAt: Date.now(),
+      };
+      uscpSessions.set(sessionId, session);
+    }
+    return session;
+  };
+
+  const isAuthorizedForSession = (
+    session: UscpSessionState,
+    providedToken?: string | null,
+    providedPin?: string | null
+  ): boolean => {
+    if (providedToken && safeEqualToken(providedToken.trim(), session.pairToken)) {
+      return true;
+    }
+    if (providedPin && safeEqualToken(providedPin.trim().toUpperCase(), session.pinCode)) {
+      return true;
+    }
+    return false;
+  };
+
+  const signPacketDigest = (session: UscpSessionState, seq: number): string => {
+    return crypto
+      .createHmac('sha256', session.hmacSecret)
+      .update(`${session.sessionId}:${seq}`)
+      .digest('hex')
+      .slice(0, 16);
+  };
+
+  const getPeerSummary = (session: UscpSessionState) =>
+    Array.from(session.clients).map((c) => ({
+      clientId: c.clientId,
+      role: c.role,
+      appNamespace: c.appNamespace,
+    }));
+
+  const broadcastToSession = (
+    session: UscpSessionState,
+    messageObj: Record<string, any>,
+    excludeClientId?: string
+  ) => {
+    const serialized = JSON.stringify(messageObj);
+    for (const client of session.clients) {
+      if (excludeClientId && client.clientId === excludeClientId) continue;
+      if (client.ws.readyState === WebSocket.OPEN) {
+        client.ws.send(serialized);
+      }
+    }
+  };
+
+  app.get('/api/uscp/schema', (_req, res) => {
+    res.json({
+      protocol: 'USCP-1.0',
+      name: 'Universal Studio Connector Protocol (Hardened)',
+      wsEndpoint:
+        '/ws/uscp?session=<SESSION_ID>&token=<PAIR_TOKEN>&role=tablet|host|app&appNamespace=<NAMESPACE>',
+      pairEndpoint: 'POST /api/uscp/sessions/:sessionId/pair',
+      restEndpoint: '/api/uscp/sessions/:sessionId',
+      security: {
+        perSessionTokenAuth: true,
+        timingSafeCompare: true,
+        hmacPacketDigest: true,
+        maxPayloadBytes: 262144,
+        rateLimitPerClientPerSec: 90,
+        heartbeatIntervalMs: 20000,
+      },
+      switchGroups: [
+        'camera_path_3d',
+        'lighting',
+        'optics_pbr',
+        'color_lut',
+        'mobile_framing',
+      ],
+      remoteActions: [
+        'export_webp',
+        'export_mp4',
+        'select_scene',
+        'reset_settings',
+        'regenerate_keyframes',
+        'open_tab',
+        'capture_vr_to_state_a',
+        'capture_vr_to_state_b',
+      ],
+      cameraPotentiometerAxes: [
+        'camYawDeg',
+        'camPitchDeg',
+        'camRollDeg',
+        'camDollyZ',
+        'camPanX',
+        'camFovOffset',
+      ],
+    });
+  });
+
+  // Host session bootstrap, PIN-to-token exchange, and 1-click pairing token rotation
+  app.post('/api/uscp/sessions/:sessionId/pair', (req, res) => {
+    const { rotate, currentToken, pin, role } = sanitizeJsonObject(req.body || {});
+    const rawId = req.params.sessionId;
+    const normalizedId =
+      (rawId || 'BUJOK-STUDIO')
+        .trim()
+        .toUpperCase()
+        .replace(/[^A-Z0-9_-]/g, '')
+        .slice(0, 32) || 'BUJOK-STUDIO';
+    const alreadyExists = uscpSessions.has(normalizedId);
+    const session = getOrCreateSession(normalizedId);
+
+    const hasValidCreds = isAuthorizedForSession(session, currentToken, pin);
+    const isHostBootstrap =
+      role === 'host' && (!alreadyExists || session.clients.size === 0 || hasValidCreds);
+
+    if (!isHostBootstrap && !hasValidCreds) {
+      res.status(401).json({
+        error: 'Sesja chroniona — zeskanuj nowy kod QR lub wpisz 6-znakowy PIN z ekranu głównego.',
+        requiresPin: true,
+      });
+      return;
+    }
+
+    if (rotate && (hasValidCreds || isHostBootstrap)) {
+      session.pairToken = crypto.randomBytes(12).toString('hex');
+      session.pinCode = createPinCode();
+      session.hmacSecret = crypto.randomBytes(16).toString('hex');
+      session.updatedAt = Date.now();
+    }
+
+    res.json({
+      protocol: 'USCP-1.0',
+      sessionId: session.sessionId,
+      pairToken: session.pairToken,
+      pinCode: session.pinCode,
+      peerCount: session.clients.size,
+    });
+  });
+
+  app.get('/api/uscp/sessions/:sessionId', (req, res) => {
+    const session = getOrCreateSession(req.params.sessionId);
+    const tok = String(req.headers['x-uscp-token'] || req.query.token || '');
+    const pin = String(req.headers['x-uscp-pin'] || req.query.pin || '');
+    if (!isAuthorizedForSession(session, tok, pin)) {
+      res.status(401).json({
+        error: 'Wymagany prawidłowy klucz parowania (token lub kod PIN sesji).',
+      });
+      return;
+    }
+
+    res.json({
+      protocol: 'USCP-1.0',
+      sessionId: session.sessionId,
+      seq: session.seq,
+      latestPacket: session.latestPacket,
+      sceneCatalog: session.sceneCatalog,
+      activeSceneId: session.activeSceneId,
+      peers: getPeerSummary(session),
+    });
+  });
+
+  app.post('/api/uscp/sessions/:sessionId', (req, res) => {
+    const session = getOrCreateSession(req.params.sessionId);
+    const tok = String(req.headers['x-uscp-token'] || req.query.token || req.body?.token || '');
+    const pin = String(req.headers['x-uscp-pin'] || req.query.pin || req.body?.pin || '');
+    if (!isAuthorizedForSession(session, tok, pin)) {
+      res.status(401).json({
+        error: 'Odrzucono żądanie — nieprawidłowy token lub kod PIN sesji USCP.',
+      });
+      return;
+    }
+
+    const body = sanitizeJsonObject(req.body || {});
+
+    if (body.type === 'uscp:packet' && body.payload?.protocol === 'USCP-1.0') {
+      session.seq += 1;
+      session.latestPacket = {
+        ...body.payload,
+        seq: session.seq,
+        integrityDigest: signPacketDigest(session, session.seq),
+      };
+      session.updatedAt = Date.now();
+      broadcastToSession(
+        session,
+        {
+          type: 'uscp:packet',
+          payload: session.latestPacket,
+        },
+        body.senderId
+      );
+    } else if (body.type === 'uscp:action' && body.action) {
+      broadcastToSession(
+        session,
+        {
+          type: 'uscp:action',
+          action: body.action,
+          payload: body.payload,
+          senderId: body.senderId,
+        },
+        body.senderId
+      );
+    }
+
+    res.json({
+      ok: true,
+      sessionId: session.sessionId,
+      seq: session.seq,
+      peerCount: session.clients.size,
+    });
+  });
 
   // 1. Deep Image & Architectural Depth Analysis (gemini-4-argon with ThinkingLevel.HIGH + automatic fallback)
   app.post('/api/gemini/analyze-depth', async (req, res) => {
@@ -765,8 +1055,227 @@ export class ErrorOverlay {}
     });
   }
 
-  app.listen(PORT, '0.0.0.0', () => {
-    console.log(`Bujok Medical Depth Studio running on http://localhost:${PORT}`);
+  const httpServer = http.createServer(app);
+  const wss = new WebSocketServer({ noServer: true, maxPayload: 256 * 1024 });
+
+  httpServer.on('upgrade', (request, socket, head) => {
+    const urlStr = request.url || '/';
+    if (!urlStr.startsWith('/ws/uscp')) {
+      socket.destroy();
+      return;
+    }
+
+    // Origin check for WebSocket upgrades
+    const origin = request.headers.origin;
+    const hostHeader = request.headers.host;
+    if (origin && hostHeader) {
+      try {
+        const originHost = new URL(origin).host;
+        const allowed =
+          originHost === hostHeader ||
+          originHost.startsWith('localhost:') ||
+          originHost.startsWith('127.0.0.1:') ||
+          originHost.endsWith('.run.app');
+        if (!allowed) {
+          socket.write('HTTP/1.1 403 Forbidden\r\n\r\n');
+          socket.destroy();
+          return;
+        }
+      } catch {
+        socket.destroy();
+        return;
+      }
+    }
+
+    wss.handleUpgrade(request, socket, head, (ws) => {
+      wss.emit('connection', ws, request);
+    });
+  });
+
+  wss.on('connection', (ws, request) => {
+    const parsedUrl = new URL(request.url || '/ws/uscp', 'http://localhost');
+    const sessionId = parsedUrl.searchParams.get('session') || 'BUJOK-STUDIO';
+    const token = parsedUrl.searchParams.get('token') || '';
+    const pin = parsedUrl.searchParams.get('pin') || '';
+    const roleParam = parsedUrl.searchParams.get('role');
+    const role: 'host' | 'tablet' | 'app' =
+      roleParam === 'tablet' || roleParam === 'app' ? roleParam : 'host';
+    const appNamespace = (
+      parsedUrl.searchParams.get('appNamespace') || 'bujok.medical.studio'
+    ).slice(0, 64);
+    const clientId = (
+      parsedUrl.searchParams.get('clientId') ||
+      `cli_${Math.random().toString(36).slice(2, 9)}`
+    ).slice(0, 40);
+
+    const session = getOrCreateSession(sessionId);
+
+    // Enforce token or PIN authentication
+    if (!isAuthorizedForSession(session, token, pin)) {
+      ws.close(4401, 'Unauthorized USCP pairing token or PIN');
+      return;
+    }
+
+    if (session.clients.size >= 16) {
+      ws.close(4429, 'Session peer limit reached');
+      return;
+    }
+
+    const clientMeta: UscpClientMeta = {
+      ws,
+      clientId,
+      role,
+      appNamespace,
+      isAlive: true,
+      rateWindowStart: Date.now(),
+      msgCountInWindow: 0,
+    };
+    session.clients.add(clientMeta);
+
+    ws.on('pong', () => {
+      clientMeta.isAlive = true;
+    });
+
+    ws.send(
+      JSON.stringify({
+        type: 'uscp:welcome',
+        sessionId: session.sessionId,
+        seq: session.seq,
+        latestPacket: session.latestPacket,
+        sceneCatalog: session.sceneCatalog,
+        activeSceneId: session.activeSceneId,
+        peers: getPeerSummary(session),
+        security: {
+          tokenProtected: true,
+          rateLimitPerSec: 90,
+          hmacDigest: true,
+        },
+      })
+    );
+
+    broadcastToSession(
+      session,
+      {
+        type: 'uscp:presence',
+        sessionId: session.sessionId,
+        peers: getPeerSummary(session),
+      },
+      clientId
+    );
+
+    ws.on('message', (raw) => {
+      // Sliding 1-second rate limiter per peer
+      const now = Date.now();
+      if (now - clientMeta.rateWindowStart >= 1000) {
+        clientMeta.rateWindowStart = now;
+        clientMeta.msgCountInWindow = 0;
+      }
+      clientMeta.msgCountInWindow += 1;
+      if (clientMeta.msgCountInWindow > 90) {
+        return; // Drop flood packets cleanly
+      }
+
+      try {
+        const parsed = JSON.parse(raw.toString());
+        if (!parsed || typeof parsed !== 'object') return;
+        const msg = sanitizeJsonObject(parsed);
+
+        if (msg.type === 'uscp:ping') {
+          if (ws.readyState === WebSocket.OPEN) {
+            ws.send(
+              JSON.stringify({
+                type: 'uscp:pong',
+                clientTs: msg.clientTs,
+                serverTs: Date.now(),
+              })
+            );
+          }
+        } else if (msg.type === 'uscp:packet' && msg.payload?.protocol === 'USCP-1.0') {
+          session.seq += 1;
+          session.latestPacket = {
+            ...msg.payload,
+            seq: session.seq,
+            integrityDigest: signPacketDigest(session, session.seq),
+          };
+          session.updatedAt = Date.now();
+          broadcastToSession(
+            session,
+            {
+              type: 'uscp:packet',
+              payload: session.latestPacket,
+            },
+            clientId
+          );
+        } else if (msg.type === 'uscp:scenes_update') {
+          if (Array.isArray(msg.sceneCatalog)) {
+            session.sceneCatalog = msg.sceneCatalog.slice(0, 24);
+          }
+          if (typeof msg.activeSceneId === 'string') {
+            session.activeSceneId = msg.activeSceneId.slice(0, 64);
+          }
+          broadcastToSession(
+            session,
+            {
+              type: 'uscp:scenes_update',
+              sceneCatalog: session.sceneCatalog,
+              activeSceneId: session.activeSceneId,
+            },
+            clientId
+          );
+        } else if (msg.type === 'uscp:action' && msg.action) {
+          broadcastToSession(
+            session,
+            {
+              type: 'uscp:action',
+              action: msg.action,
+              payload: msg.payload,
+              senderId: clientId,
+            },
+            clientId
+          );
+        }
+      } catch {
+        // Ignore malformed WS payloads
+      }
+    });
+
+    ws.on('close', () => {
+      session.clients.delete(clientMeta);
+      broadcastToSession(session, {
+        type: 'uscp:presence',
+        sessionId: session.sessionId,
+        peers: getPeerSummary(session),
+      });
+    });
+  });
+
+  // WebSocket Heartbeat & Stale Session Sweeper (every 20s)
+  const heartbeatInterval = setInterval(() => {
+    const now = Date.now();
+    for (const [sid, session] of uscpSessions.entries()) {
+      for (const client of session.clients) {
+        if (!client.isAlive) {
+          client.ws.terminate();
+          session.clients.delete(client);
+          continue;
+        }
+        client.isAlive = false;
+        if (client.ws.readyState === WebSocket.OPEN) {
+          client.ws.ping();
+        }
+      }
+      if (session.clients.size === 0 && now - session.updatedAt > 2 * 60 * 60 * 1000) {
+        uscpSessions.delete(sid);
+      }
+    }
+  }, 20000);
+
+  httpServer.on('close', () => {
+    clearInterval(heartbeatInterval);
+  });
+
+  httpServer.listen(PORT, '0.0.0.0', () => {
+    console.log(`Bujok Medical Depth Studio & Secure USCP-1.0 Hub running on http://localhost:${PORT}`);
   });
 }
 

@@ -725,6 +725,183 @@ function triggerDownload(url: string, filename: string) {
   document.body.removeChild(a);
 }
 
+export async function renderMobileGraphicAsset(options: {
+  imageUrl: string;
+  settings: VisualEffectSettings;
+  format: '9:16_story' | '9:16_wallpaper' | '4:5_feed' | '1:1_square';
+  cameraBlocking?: CameraBlockingConfig;
+  pathProgress?: number; // 0..1 along cameraBlocking path
+  headline?: string;
+  subheadline?: string;
+  ctaLabel?: string;
+  includeTypography?: boolean;
+  autoDownload?: boolean;
+}): Promise<{ dataUrl: string; width: number; height: number; filename: string }> {
+  const {
+    imageUrl,
+    settings,
+    format,
+    cameraBlocking,
+    pathProgress = 0.5,
+    headline = '',
+    subheadline = '',
+    ctaLabel = '',
+    includeTypography = true,
+    autoDownload = false,
+  } = options;
+
+  const img = await loadImageElement(imageUrl);
+  const dims: Record<typeof format, [number, number]> = {
+    '9:16_story': [1080, 1920],
+    '9:16_wallpaper': [1080, 1920],
+    '4:5_feed': [1080, 1350],
+    '1:1_square': [1080, 1080],
+  };
+  const [width, height] = dims[format];
+
+  const c = document.createElement('canvas');
+  c.width = width;
+  c.height = height;
+  const ctx = c.getContext('2d')!;
+
+  const pathProj = cameraBlocking
+    ? computeOpticalPathProjection(cameraBlocking, pathProgress)
+    : null;
+
+  const imgAspect = img.width / img.height;
+  const targetAspect = width / height;
+  let drawW = width;
+  let drawH = height;
+  if (imgAspect > targetAspect) {
+    drawH = height;
+    drawW = height * imgAspect;
+  } else {
+    drawW = width;
+    drawH = width / imgAspect;
+  }
+
+  const contrastPct = 104 + Math.round(((settings.colorGrading ?? 62) / 100) * 18);
+  const saturatePct =
+    settings.activeFxPreset === 'nordic_clean'
+      ? 94
+      : settings.activeFxPreset === 'vivid_hdr'
+        ? 122
+        : 108;
+
+  ctx.save();
+  ctx.filter = `contrast(${contrastPct}%) saturate(${saturatePct}%)`;
+  ctx.translate(width * 0.5, height * 0.5);
+  if (pathProj) {
+    ctx.rotate(pathProj.rollRad);
+    ctx.scale(pathProj.zoomScale, pathProj.zoomScale);
+    ctx.translate(pathProj.shiftXNorm * width, pathProj.shiftYNorm * height);
+  }
+  ctx.drawImage(img, -drawW * 0.5, -drawH * 0.5, drawW, drawH);
+  ctx.restore();
+
+  // Golden hour atmospheric light pass
+  const warmAlpha = Math.max(0.05, (settings.warmGlow / 100) * 0.18);
+  const warmGrad = ctx.createLinearGradient(0, 0, width * 0.85, height);
+  warmGrad.addColorStop(0, `rgba(255, 214, 142, ${warmAlpha})`);
+  warmGrad.addColorStop(0.55, `rgba(212, 175, 55, ${warmAlpha * 0.4})`);
+  warmGrad.addColorStop(1, 'rgba(9, 10, 14, 0.22)');
+  ctx.fillStyle = warmGrad;
+  ctx.fillRect(0, 0, width, height);
+
+  // Vignette
+  const vigAmt = (settings.vignetteIntensity ?? 34) / 100;
+  if (vigAmt > 0.02) {
+    const vigGrad = ctx.createRadialGradient(
+      width * 0.5,
+      height * 0.46,
+      width * 0.22,
+      width * 0.5,
+      height * 0.5,
+      height * 0.68
+    );
+    vigGrad.addColorStop(0, 'rgba(0,0,0,0)');
+    vigGrad.addColorStop(1, `rgba(6, 7, 11, ${Math.min(0.82, vigAmt * 0.72)})`);
+    ctx.fillStyle = vigGrad;
+    ctx.fillRect(0, 0, width, height);
+  }
+
+  // Optional Editorial Mobile Typography Overlay (measured contrast scrim >= 4.5:1)
+  if (includeTypography && format !== '9:16_wallpaper') {
+    const scrimGrad = ctx.createLinearGradient(0, height * 0.52, 0, height);
+    scrimGrad.addColorStop(0, 'rgba(9, 10, 13, 0)');
+    scrimGrad.addColorStop(0.45, 'rgba(9, 10, 13, 0.68)');
+    scrimGrad.addColorStop(1, 'rgba(9, 10, 13, 0.92)');
+    ctx.fillStyle = scrimGrad;
+    ctx.fillRect(0, height * 0.52, width, height * 0.48);
+
+    // Top subtle brand wordmark
+    ctx.fillStyle = 'rgba(244, 241, 234, 0.9)';
+    ctx.font = '600 28px "Cormorant Garamond", Georgia, serif';
+    ctx.textAlign = 'left';
+    ctx.fillText('BUJOK MEDICAL · WARSZAWA', 72, format === '1:1_square' ? 78 : 136);
+
+    const baseBottomY =
+      format === '9:16_story'
+        ? height - 250
+        : format === '4:5_feed'
+          ? height - 180
+          : height - 150;
+
+    if (headline.trim()) {
+      ctx.fillStyle = '#f4f1ea';
+      ctx.font = '600 58px "Cormorant Garamond", Georgia, serif';
+      const words = headline.trim().split(/\s+/);
+      const lines: string[] = [];
+      let currentLine = '';
+      for (const w of words) {
+        const test = currentLine ? `${currentLine} ${w}` : w;
+        if (ctx.measureText(test).width > width - 144 && currentLine) {
+          lines.push(currentLine);
+          currentLine = w;
+        } else {
+          currentLine = test;
+        }
+      }
+      if (currentLine) lines.push(currentLine);
+
+      lines.slice(0, 3).forEach((ln, idx) => {
+        ctx.fillText(ln, 72, baseBottomY - (lines.slice(0, 3).length - 1 - idx) * 66 - 96);
+      });
+    }
+
+    if (subheadline.trim()) {
+      ctx.fillStyle = '#d3cdc0';
+      ctx.font = '400 27px "Plus Jakarta Sans", sans-serif';
+      ctx.fillText(subheadline.trim().slice(0, 68), 72, baseBottomY - 34);
+    }
+
+    if (ctaLabel.trim()) {
+      const btnText = ctaLabel.trim();
+      ctx.font = '600 26px "Plus Jakarta Sans", sans-serif';
+      const btnW = Math.min(width - 144, Math.max(290, ctx.measureText(btnText).width + 84));
+      const btnH = 68;
+      const btnY = baseBottomY + 12;
+
+      ctx.fillStyle = '#d4af37';
+      ctx.beginPath();
+      ctx.roundRect(72, btnY, btnW, btnH, 16);
+      ctx.fill();
+
+      ctx.fillStyle = '#090a0d';
+      ctx.textAlign = 'center';
+      ctx.fillText(btnText, 72 + btnW * 0.5, btnY + 43);
+      ctx.textAlign = 'left';
+    }
+  }
+
+  const dataUrl = c.toDataURL('image/webp', 0.9);
+  const filename = `bujok-mobile-${format.replace('_', '-')}-${Math.round(pathProgress * 100)}pct.webp`;
+  if (autoDownload) {
+    triggerDownload(dataUrl, filename);
+  }
+  return { dataUrl, width, height, filename };
+}
+
 export function formatBytes(bytes: number): string {
   if (bytes < 1024) return `${bytes} B`;
   const kb = bytes / 1024;
